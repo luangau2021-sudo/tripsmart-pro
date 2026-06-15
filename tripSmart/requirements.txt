@@ -2,3 +2,4 @@ streamlit
 folium
 requests
 streamlit-autorefresh
+streamlit-js-eval

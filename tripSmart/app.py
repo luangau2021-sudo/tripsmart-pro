@@ -1,4 +1,9 @@
 import streamlit as st
+try:
+    from streamlit_js_eval import get_geolocation
+    _JSEVAL_OK = True
+except ImportError:
+    _JSEVAL_OK = False
 import streamlit.components.v1 as components
 import sys, os, folium, json
 from datetime import datetime, date, time, timedelta
@@ -860,9 +865,46 @@ def init_ml_model():
 if "Tìm đường" in menu:
     st.title("🗺️ Tìm đường thông minh")
 
+    # ── Lấy GPS làm điểm xuất phát ──────────────────────────────────────────
+    # Nếu user bấm nút, gọi get_geolocation() ngay, lưu vào session rồi rerun
+    _use_my_loc = st.button(
+        "📡 Dùng vị trí GPS của tôi làm điểm xuất phát",
+        key="btn_use_gps_origin",
+        help="Trình duyệt sẽ hỏi quyền vị trí lần đầu — chỉ hỏi 1 lần.",
+    )
+    if _use_my_loc:
+        if _JSEVAL_OK:
+            with st.spinner("📡 Đang lấy GPS…"):
+                _geo_origin = get_geolocation()
+            if _geo_origin and isinstance(_geo_origin, dict):
+                _c = _geo_origin.get("coords", {})
+                _lat_o = _c.get("latitude")
+                _lon_o = _c.get("longitude")
+                _acc_o = _c.get("accuracy")
+                if _lat_o and _lon_o:
+                    st.session_state["origin_from_gps"] = f"{_lat_o:.6f},{_lon_o:.6f}"
+                    _acc_txt = f" (±{_acc_o:.0f}m)" if _acc_o else ""
+                    st.success(f"✅ GPS: {_lat_o:.5f}, {_lon_o:.5f}{_acc_txt} — đã điền vào ô xuất phát.")
+                else:
+                    st.error("⚠️ Lấy được GPS nhưng không đọc được tọa độ.")
+            else:
+                st.warning("⏳ Chưa nhận được GPS. Hãy **cho phép quyền vị trí** trên trình duyệt rồi bấm lại.")
+        else:
+            st.error("Thiếu thư viện `streamlit-js-eval`. Chạy: `pip install streamlit-js-eval`")
+
+    # Nếu có GPS từ session, dùng làm giá trị mặc định cho ô xuất phát
+    _gps_origin_default = st.session_state.get("origin_from_gps", "")
+
     col1, col2 = st.columns(2)
     with col1:
-        origin_input = st.text_input("📍 Điểm xuất phát", placeholder="VD: TP.HCM  hoặc  10.77,106.69")
+        origin_input = st.text_input(
+            "📍 Điểm xuất phát",
+            value=_gps_origin_default,
+            placeholder="VD: TP.HCM  hoặc  10.77,106.69",
+        )
+        # Nếu user tự sửa tay → xóa GPS cache để không bị ghi đè
+        if origin_input != _gps_origin_default and _gps_origin_default:
+            st.session_state.pop("origin_from_gps", None)
     with col2:
         dest_input = st.text_input("🏁 Điểm đến", placeholder="VD: Đà Lạt  hoặc  11.94,108.44")
 
