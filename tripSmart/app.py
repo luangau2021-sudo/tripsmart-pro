@@ -37,6 +37,19 @@ section[data-testid="stSidebar"] *{color:white!important;}
 .risk-mid    {color:#f57c00;font-weight:700;}
 .risk-high   {color:#c62828;font-weight:700;}
 .compare-winner{background:linear-gradient(90deg,#fffde7,#fff9c4);border-left:4px solid #ffc107;}
+/* GPS IoT widget */
+.iot-panel{border-radius:16px;padding:20px 24px;margin:10px 0;transition:all .3s;}
+.iot-safe   {background:#f1f8e9;border:2.5px solid #43a047;}
+.iot-warning{background:#fffde7;border:2.5px solid #f9a825;}
+.iot-danger {background:#fff5f5;border:2.5px solid #e53935;}
+.iot-led{width:56px;height:56px;border-radius:50%;flex-shrink:0;transition:background .4s,box-shadow .4s;}
+.iot-led-safe   {background:#43a047;box-shadow:0 0 22px #43a047;}
+.iot-led-warning{background:#f9a825;box-shadow:0 0 22px #f9a825;}
+.iot-led-danger {background:#e53935;box-shadow:0 0 28px #e53935;}
+.gps-badge{display:inline-flex;align-items:center;gap:6px;background:#e3f2fd;
+           border:1.5px solid #1976d2;border-radius:20px;padding:4px 12px;font-size:.82rem;font-weight:600;}
+.gps-dot{width:9px;height:9px;border-radius:50%;background:#1976d2;animation:gpspulse 1.4s infinite;}
+@keyframes gpspulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(1.4)}}
 </style>""", unsafe_allow_html=True)
 
 try:
@@ -66,6 +79,199 @@ def init_engines():
 
 def risk_color(s):
     return "🔴" if s >= 0.7 else "🟡" if s >= 0.4 else "🟢"
+
+
+import math
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Khoảng cách đường chim bay (km) giữa 2 toạ độ."""
+    R = 6371.0
+    rl = math.radians
+    dlat = rl(lat2 - lat1); dlon = rl(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(rl(lat1))*math.cos(rl(lat2))*math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def _find_nearest_segment(gps_lat, gps_lon, polyline):
+    """
+    Trả về dict: {segment_idx, lat, lon, dist_km, progress_ratio}
+    polyline: list [[lon, lat], ...]  (OSRM format — lon trước)
+    """
+    best_idx, best_dist = 0, 999.0
+    for i, pt in enumerate(polyline):
+        lon_p, lat_p = pt[0], pt[1]
+        d = _haversine_km(gps_lat, gps_lon, lat_p, lon_p)
+        if d < best_dist:
+            best_dist = d
+            best_idx = i
+    return {
+        "segment_idx"    : best_idx,
+        "lat"            : polyline[best_idx][1],
+        "lon"            : polyline[best_idx][0],
+        "dist_km"        : round(best_dist, 3),
+        "progress_ratio" : best_idx / max(1, len(polyline) - 1),
+    }
+
+
+def _calc_iot_state_from_gps(gps_lat, gps_lon, danger_markers, total_km):
+    """
+    Tính trạng thái IoT (safe/warning/danger) dựa trên GPS thật.
+    danger_markers: list dict có keys lat,lon,score,route_km,label,...
+    Trả về dict trạng thái đầy đủ.
+    """
+    # Tìm điểm nguy hiểm gần nhất (theo tọa độ thật)
+    nearest_danger = None
+    nearest_dist   = 999.0
+    for seg in danger_markers:
+        seg_lat = seg.get("lat") or seg.get("center_lat")
+        seg_lon = seg.get("lon") or seg.get("center_lon")
+        if seg_lat is None or seg_lon is None:
+            continue
+        d = _haversine_km(gps_lat, gps_lon, seg_lat, seg_lon)
+        if d < nearest_dist:
+            nearest_dist   = d
+            nearest_danger = seg
+
+    # Điểm nguy hiểm phía trước (dùng route_km nếu không có tọa độ)
+    next_danger  = None
+    next_danger_dist = 999.0
+    for seg in sorted(danger_markers, key=lambda x: x.get("route_km", 0)):
+        seg_lat = seg.get("lat") or seg.get("center_lat")
+        seg_lon = seg.get("lon") or seg.get("center_lon")
+        if seg_lat and seg_lon:
+            d = _haversine_km(gps_lat, gps_lon, seg_lat, seg_lon)
+            if d > 0.05:   # Bỏ qua điểm đang đứng trên nó
+                next_danger      = seg
+                next_danger_dist = d
+                break
+
+    cur_score = float(nearest_danger.get("score", 0)) if nearest_danger and nearest_dist < 1.0 else 0.0
+
+    if cur_score >= 0.60 or nearest_dist < 0.5:
+        state = "danger"
+    elif cur_score >= 0.35 or nearest_dist < 2.0:
+        state = "warning"
+    elif next_danger_dist < 5.0:
+        state = "warning"
+    else:
+        state = "safe"
+
+    return {
+        "state"           : state,
+        "nearest_danger"  : nearest_danger,
+        "nearest_dist"    : round(nearest_dist, 2),
+        "next_danger"     : next_danger,
+        "next_danger_dist": round(next_danger_dist, 2),
+        "cur_score"       : cur_score,
+    }
+
+
+def _build_gps_component_html(interval_ms: int = 5000) -> str:
+    """
+    Trả về HTML nhúng component JS:
+    - Hỏi quyền GPS 1 lần
+    - Cập nhật tự động theo interval_ms
+    - Ghi tọa độ vào localStorage key 'tripsmart_gps'
+    - Hiển thị badge trạng thái GPS nhỏ gọn
+    - Dùng postMessage để gửi toạ độ lên Streamlit parent frame
+    """
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{{margin:0;padding:6px;font-family:'Segoe UI',sans-serif;background:transparent;}}
+  #gps-box{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}}
+  .badge{{display:inline-flex;align-items:center;gap:6px;border-radius:20px;
+          padding:5px 14px;font-size:.82rem;font-weight:600;border:1.5px solid;}}
+  .badge-ok   {{background:#e3f2fd;border-color:#1976d2;color:#1565c0;}}
+  .badge-warn {{background:#fff3e0;border-color:#f57c00;color:#e65100;}}
+  .badge-err  {{background:#ffebee;border-color:#e53935;color:#b71c1c;}}
+  .dot{{width:9px;height:9px;border-radius:50%;animation:pulse 1.4s infinite;}}
+  .dot-blue  {{background:#1976d2;}}
+  .dot-orange{{background:#f57c00;}}
+  .dot-red   {{background:#e53935;}}
+  @keyframes pulse{{0%,100%{{opacity:1;transform:scale(1)}}50%{{opacity:.4;transform:scale(1.5)}}}}
+  #coords{{font-size:.78rem;color:#555;margin-top:2px;}}
+  #btn-gps{{padding:6px 16px;background:#1976d2;color:white;border:none;
+            border-radius:20px;cursor:pointer;font-size:.82rem;font-weight:600;}}
+  #btn-gps:hover{{background:#1565c0;}}
+</style>
+</head>
+<body>
+<div id="gps-box">
+  <button id="btn-gps" onclick="requestGPS()">📡 Bật GPS tự động</button>
+  <span id="badge-area"></span>
+</div>
+<div id="coords"></div>
+
+<script>
+const INTERVAL_MS = {interval_ms};
+let watchId = null;
+let permitted = false;
+
+function setBadge(cls, dot, text) {{
+  document.getElementById('badge-area').innerHTML =
+    `<span class="badge ${{cls}}"><span class="dot ${{dot}}"></span>${{text}}</span>`;
+}}
+
+function sendPos(lat, lon, acc) {{
+  const payload = {{lat, lon, acc, ts: Date.now()}};
+  // Gửi lên Streamlit qua postMessage
+  window.parent.postMessage({{type: 'tripsmart_gps', payload}}, '*');
+  // Lưu localStorage để iframe khác đọc
+  try {{ localStorage.setItem('tripsmart_gps', JSON.stringify(payload)); }} catch(e) {{}}
+  document.getElementById('coords').textContent =
+    `📍 Lat: ${{lat.toFixed(6)}}  Lon: ${{lon.toFixed(6)}}  ±${{acc ? acc.toFixed(0) : '?'}}m`;
+}}
+
+function onPos(pos) {{
+  setBadge('badge-ok','dot-blue','GPS đang hoạt động');
+  sendPos(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
+}}
+
+function onErr(err) {{
+  setBadge('badge-err','dot-red', err.code === 1 ? 'Bị từ chối quyền GPS' : 'Không lấy được GPS');
+}}
+
+function requestGPS() {{
+  if (!navigator.geolocation) {{
+    setBadge('badge-err','dot-red','Trình duyệt không hỗ trợ GPS');
+    return;
+  }}
+  setBadge('badge-warn','dot-orange','Đang chờ quyền GPS…');
+  // Lần đầu: lấy ngay
+  navigator.geolocation.getCurrentPosition(onPos, onErr, {{
+    enableHighAccuracy: true, timeout: 10000, maximumAge: 0
+  }});
+  // Sau đó theo dõi liên tục
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = navigator.geolocation.watchPosition(onPos, onErr, {{
+    enableHighAccuracy: true, timeout: 10000, maximumAge: 2000
+  }});
+  document.getElementById('btn-gps').textContent = '🔄 GPS đang theo dõi…';
+  document.getElementById('btn-gps').disabled = true;
+  permitted = true;
+}}
+
+// Tự khởi động nếu đã được cấp quyền trước đó (check localStorage)
+window.addEventListener('load', () => {{
+  try {{
+    const saved = localStorage.getItem('tripsmart_gps');
+    if (saved) {{
+      const p = JSON.parse(saved);
+      // Nếu GPS cũ < 30 giây thì tự bật
+      if (Date.now() - p.ts < 30000) {{
+        requestGPS();
+      }}
+    }}
+  }} catch(e) {{}}
+}});
+</script>
+</body>
+</html>
+"""
 
 
 def _get_route_duration_seconds(route: dict) -> float:
@@ -957,9 +1163,10 @@ if "Tìm đường" in menu:
 
         rpts = crowd.get_nearby_reports(lat1, lon1, 60)
 
-        # Lưu vào session cho mô phỏng IoT
+        # Lưu vào session cho cảnh báo IoT GPS
         st.session_state["last_danger_markers"] = danger_markers
         st.session_state["last_route_km"] = route.get("distance_km", 0)
+        st.session_state["last_polyline"]  = polyline
         # Reset IoT step khi tuyến mới được chọn
         if st.session_state.get("_prev_selected") != selected:
             st.session_state["iot_step"] = 0
@@ -1074,186 +1281,284 @@ if "Tìm đường" in menu:
                     f'<span style="color:#888;font-size:.8em">— {s["distance_km"]} km · {s["duration_min"]} phút</span></div>',
                     unsafe_allow_html=True)
 
-    # ── MÔ PHỎNG CẢNH BÁO TRÊN XE (IoT Simulation) ─────────────────────────
+    # ── CẢNH BÁO IOT THEO GPS THẬT ───────────────────────────────────────────
     if st.session_state.get("last_routes") and st.session_state.get("last_danger_markers"):
         st.divider()
-        st.subheader("🚨 Mô phỏng thiết bị cảnh báo IoT trên xe")
-        st.caption(
-            "Mô phỏng nguyên lý hoạt động: xe di chuyển trên tuyến → phát hiện vùng nguy hiểm "
-            "→ đổi trạng thái LED + Buzzer → cảnh báo người lái. "
-            "*(Phiên bản demo — chưa cần phần cứng thật)*"
+        st.subheader("🚨 Cảnh báo IoT theo GPS thật")
+
+        _iot_dangers  = st.session_state.get("last_danger_markers", [])
+        _iot_total_km = st.session_state.get("last_route_km", 0) or 1
+        _iot_polyline = st.session_state.get("last_polyline", [])
+
+        # ── Chế độ: GPS thật hoặc mô phỏng thủ công ─────────────────────────
+        _iot_mode = st.radio(
+            "Chế độ hoạt động",
+            ["📡 GPS tự động (điện thoại)", "🕹️ Mô phỏng thủ công"],
+            horizontal=True,
+            key="iot_mode_radio",
         )
+        _use_gps = (_iot_mode == "📡 GPS tự động (điện thoại)")
 
-        # ── Lấy danh sách điểm nguy hiểm từ session ─────────────────────────
-        _sim_dangers = st.session_state.get("last_danger_markers", [])
-        # Sắp theo km để mô phỏng xe đi tới lần lượt
-        _sim_dangers = sorted(_sim_dangers, key=lambda x: x.get("route_km", 0))
-        _total_km    = st.session_state.get("last_route_km", 0) or 1
-
-        # Số điểm mô phỏng = số vùng nguy hiểm + 2 (xuất phát & đích)
-        _sim_steps   = [{"label": "🟢 Xuất phát", "route_km": 0.0, "score": 0.0,
-                          "type": "start", "icon": "🚦", "desc": "Bắt đầu hành trình."}]
-        _sim_steps  += _sim_dangers
-        _sim_steps  += [{"label": "🏁 Điểm đến", "route_km": float(_total_km),
-                          "score": 0.0, "type": "end", "icon": "🏁", "desc": "Đã đến điểm đến."}]
-
-        # Chỉ mục bước hiện tại
-        if "iot_step" not in st.session_state:
-            st.session_state["iot_step"] = 0
-
-        _cur_idx  = int(st.session_state.get("iot_step", 0))
-        _cur_idx  = max(0, min(_cur_idx, len(_sim_steps) - 1))
-        _cur_pt   = _sim_steps[_cur_idx]
-
-        # Tính khoảng cách đến vùng nguy hiểm gần nhất (km tuyến)
-        _next_danger = None
-        for _pt in _sim_steps[_cur_idx + 1:]:
-            if _pt.get("score", 0) >= 0.40:
-                _next_danger = _pt
-                break
-        _dist_to_danger = (
-            _next_danger["route_km"] - _cur_pt.get("route_km", 0)
-            if _next_danger else 999.0
-        )
-
-        # Xác định trạng thái cảnh báo
-        _cur_score = float(_cur_pt.get("score", 0))
-        if _cur_score >= 0.60 or _dist_to_danger < 2.0:
-            _state      = "danger"
-            _led_color  = "#e53935"
-            _led_label  = "🔴 ĐỎ — Nguy hiểm"
-            _buzzer     = "🔊 BẬT — Phát tiếng cảnh báo!"
-            _state_text = "NGUY HIỂM"
-            _rec        = "⛔ Giảm tốc độ ngay, tăng cự ly với xe trước, sẵn sàng dừng khẩn cấp."
-            _bg         = "#fff5f5"
-            _border     = "#e53935"
-        elif _cur_score >= 0.35 or _dist_to_danger < 5.0:
-            _state      = "warning"
-            _led_color  = "#f9a825"
-            _led_label  = "🟡 VÀNG — Cảnh báo"
-            _buzzer     = "🔕 TẮT"
-            _state_text = "CẢNH BÁO"
-            _rec        = "⚠️ Chú ý quan sát, giữ tốc độ an toàn, chuẩn bị vào vùng rủi ro."
-            _bg         = "#fffde7"
-            _border     = "#f9a825"
-        else:
-            _state      = "safe"
-            _led_color  = "#43a047"
-            _led_label  = "🟢 XANH — An toàn"
-            _buzzer     = "🔕 TẮT"
-            _state_text = "AN TOÀN"
-            _rec        = "✅ Hành trình bình thường. Tiếp tục quan sát biển báo và điều kiện đường."
-            _bg         = "#f1f8e9"
-            _border     = "#43a047"
-
-        # ── Nút điều khiển mô phỏng ──────────────────────────────────────────
-        btn1, btn2, btn3, btn4 = st.columns(4)
-        with btn1:
-            if st.button("▶️ Bắt đầu / Điểm tiếp theo", type="primary", key="iot_next",
-                         use_container_width=True):
-                if _cur_idx < len(_sim_steps) - 1:
-                    st.session_state["iot_step"] = _cur_idx + 1
-                st.rerun()
-        with btn2:
-            if st.button("⏮️ Quay lại", key="iot_prev", use_container_width=True):
-                if _cur_idx > 0:
-                    st.session_state["iot_step"] = _cur_idx - 1
-                st.rerun()
-        with btn3:
-            if st.button("⏭️ Nhảy đến nguy hiểm", key="iot_jump", use_container_width=True):
-                _danger_idx = next(
-                    (i for i, p in enumerate(_sim_steps) if p.get("score", 0) >= 0.60),
-                    None
-                )
-                if _danger_idx is not None:
-                    st.session_state["iot_step"] = _danger_idx
-                    st.rerun()
-        with btn4:
-            if st.button("🔄 Reset mô phỏng", key="iot_reset", use_container_width=True):
-                st.session_state["iot_step"] = 0
-                st.rerun()
-
-        # ── Thanh tiến trình ─────────────────────────────────────────────────
-        _progress = _cur_idx / max(1, len(_sim_steps) - 1)
-        st.progress(_progress, text=f"Bước {_cur_idx + 1}/{len(_sim_steps)} · km {_cur_pt.get('route_km', 0):.1f}")
-
-        # ── Bảng hiển thị trạng thái thiết bị ───────────────────────────────
-        st.markdown(
-            f'<div style="background:{_bg};border:2.5px solid {_border};border-radius:14px;'
-            f'padding:18px 22px;margin:12px 0">'
-
-            # Header
-            f'<div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">'
-            f'<div style="width:52px;height:52px;border-radius:50%;background:{_led_color};'
-            f'box-shadow:0 0 18px {_led_color};flex-shrink:0"></div>'
-            f'<div><div style="font-size:1.35rem;font-weight:700;color:{_border}">'
-            f'⚡ TRẠNG THÁI: {_state_text}</div>'
-            f'<div style="font-size:.88rem;color:#555">📍 {_cur_pt.get("icon","📍")} '
-            f'{_cur_pt.get("label","—")} · km {_cur_pt.get("route_km",0):.1f}</div>'
-            f'</div></div>'
-
-            # Thông số thiết bị
-            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px">'
-
-            f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;'
-            f'border:1.5px solid {_border}30">'
-            f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">💡 LED MÔ PHỎNG</div>'
-            f'<div style="font-weight:700;color:{_led_color};font-size:.95rem">{_led_label}</div>'
-            f'</div>'
-
-            f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;'
-            f'border:1.5px solid {_border}30">'
-            f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">🔔 BUZZER MÔ PHỎNG</div>'
-            f'<div style="font-weight:700;font-size:.95rem">{_buzzer}</div>'
-            f'</div>'
-
-            f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;'
-            f'border:1.5px solid {_border}30">'
-            f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">📡 CÁC VỊ TRÍ NGUY HIỂM</div>'
-            f'<div style="font-weight:700;font-size:.95rem">'
-            + (f'≈ {_dist_to_danger:.1f} km phía trước' if _dist_to_danger < 900 else '✅ Không có') +
-            f'</div></div></div>'
-
-            # Vùng nguy hiểm sắp tới
-            + (
-                f'<div style="background:#fff3e0;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
-                f'⚠️ <b>Vùng sắp tới:</b> {_next_danger.get("icon","⚠️")} '
-                f'<b>{_next_danger.get("label","")}</b> · km {_next_danger.get("route_km",0):.0f}'
-                f' · Rủi ro {_next_danger.get("score",0):.0%}'
-                f'<br><span style="font-size:.83rem;color:#555">{_next_danger.get("desc","")}</span>'
-                f'</div>'
-                if _next_danger else
-                '<div style="background:#e8f5e9;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
-                '✅ <b>Không có vùng nguy hiểm nào phía trước.</b>'
-                '</div>'
+        # ═══════════════════════════════════════════════════════════════════════
+        # CHẾ ĐỘ 1: GPS THẬT
+        # ═══════════════════════════════════════════════════════════════════════
+        if _use_gps:
+            st.caption(
+                "📱 App sử dụng GPS điện thoại để tự động xác định vị trí và cảnh báo nguy hiểm "
+                "theo tuyến đang chọn. Bấm **Bật GPS tự động** → trình duyệt sẽ hỏi quyền vị trí "
+                "*(chỉ hỏi 1 lần)*, sau đó cập nhật mỗi 5 giây."
             )
 
-            # Khuyến nghị
-            + f'<div style="font-size:.92rem;padding:8px 4px">'
-            f'<b>🧭 Khuyến nghị:</b> {_rec}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+            # ── Nhúng component JS lấy GPS ───────────────────────────────────
+            gps_html = _build_gps_component_html(interval_ms=5000)
+            components.html(gps_html, height=72, scrolling=False)
 
-        # ── Danh sách điểm mô phỏng nhỏ gọn ─────────────────────────────────
-        with st.expander(f"📋 Toàn bộ {len(_sim_steps)} điểm mô phỏng trên tuyến", expanded=False):
-            for i, pt in enumerate(_sim_steps):
-                sc = pt.get("score", 0)
-                if sc >= 0.60:   dot = "🔴"
-                elif sc >= 0.35: dot = "🟡"
-                else:            dot = "🟢"
-                active_style = (
-                    "background:#e3f2fd;border-left:4px solid #1976d2;font-weight:700"
-                    if i == _cur_idx else ""
+            # ── Nhận tọa độ từ query_params (Streamlit ≥1.27 dùng st.query_params) ─
+            # Cách hoạt động: JS ghi vào localStorage; nút "Cập nhật GPS" đọc lại
+            # và lưu vào session. Không cần st.experimental_rerun liên tục.
+            gps_col1, gps_col2 = st.columns([3, 1])
+            with gps_col1:
+                _gps_input = st.text_input(
+                    "📍 Nhập tọa độ GPS (lat,lon) — tự điền sau khi bấm Lấy GPS hoặc nhập tay",
+                    value=st.session_state.get("gps_manual_input", ""),
+                    placeholder="VD: 11.9404, 108.4583",
+                    key="gps_coord_input",
                 )
+            with gps_col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🔄 Cập nhật vị trí", key="gps_refresh", use_container_width=True):
+                    st.session_state["gps_manual_input"] = _gps_input
+                    st.rerun()
+
+            # Thêm JS tự điền ô input khi GPS được lấy
+            st.markdown("""
+<script>
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'tripsmart_gps') {
+    const p = e.data.payload;
+    const coord = p.lat.toFixed(6) + ', ' + p.lon.toFixed(6);
+    // Tìm input Streamlit và gán giá trị
+    const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+    for (const inp of inputs) {
+      if (inp.placeholder && inp.placeholder.includes('lat,lon')) {
+        inp.value = coord;
+        inp.dispatchEvent(new Event('input', {bubbles:true}));
+        break;
+      }
+    }
+  }
+});
+</script>""", unsafe_allow_html=True)
+
+            # Parse tọa độ GPS
+            _gps_lat = _gps_lon = None
+            _gps_raw = st.session_state.get("gps_manual_input", "") or _gps_input
+            if _gps_raw and "," in _gps_raw:
+                try:
+                    _parts = _gps_raw.replace(" ", "").split(",")
+                    _gps_lat, _gps_lon = float(_parts[0]), float(_parts[1])
+                except Exception:
+                    pass
+
+            if _gps_lat is not None:
+                # ── Tính trạng thái IoT từ GPS thật ─────────────────────────
+                _iot = _calc_iot_state_from_gps(_gps_lat, _gps_lon, _iot_dangers, _iot_total_km)
+                _state        = _iot["state"]
+                _nd           = _iot["nearest_danger"]
+                _nearest_dist = _iot["nearest_dist"]
+                _next_d       = _iot["next_danger"]
+                _next_dist    = _iot["next_danger_dist"]
+                _cur_score    = _iot["cur_score"]
+
+                # Tìm segment gần nhất trên polyline
+                _seg_info = _find_nearest_segment(_gps_lat, _gps_lon, _iot_polyline) if _iot_polyline else {}
+                _progress_ratio = _seg_info.get("progress_ratio", 0.0)
+
+                # Map state → UI
+                _STATE_MAP = {
+                    "safe"   : ("#43a047","#f1f8e9","🟢 XANH — An toàn",   "🔕 TẮT","AN TOÀN",
+                                "✅ Hành trình bình thường. Tiếp tục quan sát biển báo và điều kiện đường."),
+                    "warning": ("#f9a825","#fffde7","🟡 VÀNG — Cảnh báo",  "🔕 TẮT","CẢNH BÁO",
+                                "⚠️ Chú ý quan sát, giữ tốc độ an toàn, chuẩn bị vào vùng rủi ro."),
+                    "danger" : ("#e53935","#fff5f5","🔴 ĐỎ — Nguy hiểm", "🔊 BẬT — Phát tiếng cảnh báo!","NGUY HIỂM",
+                                "⛔ Giảm tốc độ ngay, tăng cự ly với xe trước, sẵn sàng dừng khẩn cấp."),
+                }
+                _led_color,_bg,_led_label,_buzzer,_state_text,_rec = _STATE_MAP[_state]
+                _border = _led_color
+
+                st.progress(_progress_ratio,
+                            text=f"🚗 Tiến trình trên tuyến: {_progress_ratio:.0%} · GPS: {_gps_lat:.5f}, {_gps_lon:.5f}")
+
                 st.markdown(
-                    f'<div class="step-box" style="{active_style}">'
-                    f'{dot} <b>Bước {i+1}</b> · {pt.get("icon","📍")} {pt.get("label","—")} '
-                    f'· km {pt.get("route_km",0):.1f}'
-                    + (f' · Rủi ro {sc:.0%}' if sc > 0 else '')
-                    + f'</div>',
+                    f'<div style="background:{_bg};border:2.5px solid {_border};border-radius:14px;'
+                    f'padding:18px 22px;margin:12px 0">'
+                    f'<div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">'
+                    f'<div style="width:56px;height:56px;border-radius:50%;background:{_led_color};'
+                    f'box-shadow:0 0 24px {_led_color};flex-shrink:0"></div>'
+                    f'<div><div style="font-size:1.35rem;font-weight:700;color:{_border}">'
+                    f'⚡ TRẠNG THÁI: {_state_text}</div>'
+                    f'<div style="font-size:.86rem;color:#555">'
+                    f'📡 GPS: {_gps_lat:.5f}, {_gps_lon:.5f}</div></div></div>'
+
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px">'
+
+                    f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;border:1.5px solid {_border}30">'
+                    f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">💡 LED MÔ PHỎNG</div>'
+                    f'<div style="font-weight:700;color:{_led_color};font-size:.93rem">{_led_label}</div></div>'
+
+                    f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;border:1.5px solid {_border}30">'
+                    f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">🔔 BUZZER MÔ PHỎNG</div>'
+                    f'<div style="font-weight:700;font-size:.93rem">{_buzzer}</div></div>'
+
+                    f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;border:1.5px solid {_border}30">'
+                    f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">📡 NGUY HIỂM GẦN NHẤT</div>'
+                    f'<div style="font-weight:700;font-size:.93rem">'
+                    + (f'≈ {_nearest_dist:.2f} km' if _nearest_dist < 900 else '✅ Không có') +
+                    f'</div></div></div>'
+
+                    + (
+                        f'<div style="background:#fff3e0;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                        f'⚠️ <b>Vùng sắp tới:</b> {_next_d.get("icon","⚠️")} '
+                        f'<b>{_next_d.get("label","")}</b> · {_next_dist:.1f} km'
+                        f' · Rủi ro {_next_d.get("score",0):.0%}'
+                        f'<br><span style="font-size:.82rem;color:#555">{_next_d.get("desc","")}</span></div>'
+                        if _next_d and _next_dist < 900 else
+                        '<div style="background:#e8f5e9;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                        '✅ <b>Không có vùng nguy hiểm nào phía trước.</b></div>'
+                    )
+
+                    + f'<div style="font-size:.92rem;padding:8px 4px"><b>🧭 Khuyến nghị:</b> {_rec}</div>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
+
+                # ── Cập nhật tự động mỗi 10 giây khi GPS đang chạy ──────────
+                st.markdown("""
+<script>
+setTimeout(function() {
+  // Tìm nút Cập nhật vị trí và click tự động
+  const btns = window.parent.document.querySelectorAll('button');
+  for (const b of btns) {
+    if (b.innerText && b.innerText.includes('Cập nhật vị trí')) {
+      b.click(); break;
+    }
+  }
+}, 10000);
+</script>""", unsafe_allow_html=True)
+
+            else:
+                st.info("📡 Bấm **Bật GPS tự động** ở trên để lấy vị trí, "
+                        "hoặc nhập tọa độ thủ công vào ô `lat,lon` rồi bấm **Cập nhật vị trí**.")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # CHẾ ĐỘ 2: MÔ PHỎNG THỦ CÔNG (giữ nguyên logic cũ)
+        # ═══════════════════════════════════════════════════════════════════════
+        else:
+            st.caption(
+                "🕹️ Mô phỏng xe di chuyển từng bước trên tuyến. "
+                "Bấm **▶️ Tiếp theo** để tiến đến điểm kế tiếp."
+            )
+            _sim_dangers = sorted(_iot_dangers, key=lambda x: x.get("route_km", 0))
+            _sim_steps   = [{"label":"🟢 Xuất phát","route_km":0.0,"score":0.0,
+                             "type":"start","icon":"🚦","desc":"Bắt đầu hành trình."}]
+            _sim_steps  += _sim_dangers
+            _sim_steps  += [{"label":"🏁 Điểm đến","route_km":float(_iot_total_km),
+                             "score":0.0,"type":"end","icon":"🏁","desc":"Đã đến điểm đến."}]
+
+            if "iot_step" not in st.session_state:
+                st.session_state["iot_step"] = 0
+            _cur_idx = max(0, min(int(st.session_state.get("iot_step",0)), len(_sim_steps)-1))
+            _cur_pt  = _sim_steps[_cur_idx]
+
+            _next_danger = next((_p for _p in _sim_steps[_cur_idx+1:] if _p.get("score",0)>=0.40), None)
+            _dist_to_danger = (_next_danger["route_km"] - _cur_pt.get("route_km",0)
+                               if _next_danger else 999.0)
+            _cur_score = float(_cur_pt.get("score",0))
+
+            if _cur_score >= 0.60 or _dist_to_danger < 2.0:
+                _led_color="#e53935";_bg="#fff5f5";_border="#e53935"
+                _led_label="🔴 ĐỎ — Nguy hiểm";_buzzer="🔊 BẬT — Phát tiếng cảnh báo!"
+                _state_text="NGUY HIỂM"
+                _rec="⛔ Giảm tốc độ ngay, tăng cự ly với xe trước, sẵn sàng dừng khẩn cấp."
+            elif _cur_score >= 0.35 or _dist_to_danger < 5.0:
+                _led_color="#f9a825";_bg="#fffde7";_border="#f9a825"
+                _led_label="🟡 VÀNG — Cảnh báo";_buzzer="🔕 TẮT"
+                _state_text="CẢNH BÁO"
+                _rec="⚠️ Chú ý quan sát, giữ tốc độ an toàn, chuẩn bị vào vùng rủi ro."
+            else:
+                _led_color="#43a047";_bg="#f1f8e9";_border="#43a047"
+                _led_label="🟢 XANH — An toàn";_buzzer="🔕 TẮT"
+                _state_text="AN TOÀN"
+                _rec="✅ Hành trình bình thường. Tiếp tục quan sát biển báo và điều kiện đường."
+
+            btn1,btn2,btn3,btn4 = st.columns(4)
+            with btn1:
+                if st.button("▶️ Bắt đầu / Tiếp theo", type="primary", key="iot_next", use_container_width=True):
+                    if _cur_idx < len(_sim_steps)-1: st.session_state["iot_step"] = _cur_idx+1
+                    st.rerun()
+            with btn2:
+                if st.button("⏮️ Quay lại", key="iot_prev", use_container_width=True):
+                    if _cur_idx > 0: st.session_state["iot_step"] = _cur_idx-1
+                    st.rerun()
+            with btn3:
+                if st.button("⏭️ Nhảy đến nguy hiểm", key="iot_jump", use_container_width=True):
+                    _di = next((i for i,p in enumerate(_sim_steps) if p.get("score",0)>=0.60), None)
+                    if _di is not None: st.session_state["iot_step"] = _di
+                    st.rerun()
+            with btn4:
+                if st.button("🔄 Reset", key="iot_reset", use_container_width=True):
+                    st.session_state["iot_step"] = 0; st.rerun()
+
+            st.progress(_cur_idx/max(1,len(_sim_steps)-1),
+                        text=f"Bước {_cur_idx+1}/{len(_sim_steps)} · km {_cur_pt.get('route_km',0):.1f}")
+
+            st.markdown(
+                f'<div style="background:{_bg};border:2.5px solid {_border};border-radius:14px;'
+                f'padding:18px 22px;margin:12px 0">'
+                f'<div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">'
+                f'<div style="width:52px;height:52px;border-radius:50%;background:{_led_color};'
+                f'box-shadow:0 0 18px {_led_color};flex-shrink:0"></div>'
+                f'<div><div style="font-size:1.35rem;font-weight:700;color:{_border}">⚡ TRẠNG THÁI: {_state_text}</div>'
+                f'<div style="font-size:.88rem;color:#555">📍 {_cur_pt.get("icon","📍")} '
+                f'{_cur_pt.get("label","—")} · km {_cur_pt.get("route_km",0):.1f}</div></div></div>'
+
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px">'
+                f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;border:1.5px solid {_border}30">'
+                f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">💡 LED MÔ PHỎNG</div>'
+                f'<div style="font-weight:700;color:{_led_color};font-size:.95rem">{_led_label}</div></div>'
+                f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;border:1.5px solid {_border}30">'
+                f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">🔔 BUZZER MÔ PHỎNG</div>'
+                f'<div style="font-weight:700;font-size:.95rem">{_buzzer}</div></div>'
+                f'<div style="background:white;border-radius:10px;padding:12px;text-align:center;border:1.5px solid {_border}30">'
+                f'<div style="font-size:.75rem;color:#888;margin-bottom:4px">📡 NGUY HIỂM PHÍA TRƯỚC</div>'
+                f'<div style="font-weight:700;font-size:.95rem">'
+                + (f'≈ {_dist_to_danger:.1f} km' if _dist_to_danger < 900 else '✅ Không có') +
+                f'</div></div></div>'
+                + (
+                    f'<div style="background:#fff3e0;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                    f'⚠️ <b>Vùng sắp tới:</b> {_next_danger.get("icon","⚠️")} '
+                    f'<b>{_next_danger.get("label","")}</b> · km {_next_danger.get("route_km",0):.0f}'
+                    f' · Rủi ro {_next_danger.get("score",0):.0%}'
+                    f'<br><span style="font-size:.83rem;color:#555">{_next_danger.get("desc","")}</span></div>'
+                    if _next_danger else
+                    '<div style="background:#e8f5e9;border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                    '✅ <b>Không có vùng nguy hiểm nào phía trước.</b></div>'
+                )
+                + f'<div style="font-size:.92rem;padding:8px 4px"><b>🧭 Khuyến nghị:</b> {_rec}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            with st.expander(f"📋 Toàn bộ {len(_sim_steps)} điểm mô phỏng", expanded=False):
+                for i,pt in enumerate(_sim_steps):
+                    sc = pt.get("score",0)
+                    dot = "🔴" if sc>=0.60 else "🟡" if sc>=0.35 else "🟢"
+                    active = "background:#e3f2fd;border-left:4px solid #1976d2;font-weight:700" if i==_cur_idx else ""
+                    st.markdown(
+                        f'<div class="step-box" style="{active}">'
+                        f'{dot} <b>Bước {i+1}</b> · {pt.get("icon","📍")} {pt.get("label","—")} '
+                        f'· km {pt.get("route_km",0):.1f}'
+                        + (f' · Rủi ro {sc:.0%}' if sc>0 else '')
+                        + f'</div>', unsafe_allow_html=True)
 
     # ── REROUTE ──────────────────────────────────────────────────────────────
     if st.session_state.get("last_routes"):
