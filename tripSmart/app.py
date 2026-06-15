@@ -6,6 +6,13 @@ except ImportError:
     _JSEVAL_OK = False
 import streamlit.components.v1 as components
 import sys, os, folium, json
+
+# ── Live Navigation (tích hợp vào phần Tìm đường) ───────────────────────────
+try:
+    from live_navigation import render_live_navigation
+    _LIVE_NAV_OK = True
+except ImportError:
+    _LIVE_NAV_OK = False
 from datetime import datetime, date, time, timedelta
 EMOTION_LABELS = {1:"😞",2:"😐",3:"😊",4:"😄",5:"🤩"}
 st.set_page_config(page_title="TripSmart Pro", page_icon="🗺️",
@@ -1260,6 +1267,47 @@ if "Tìm đường" in menu:
             forecast_segments=route_risk_forecast.get("segments") if route_risk_forecast else None,
         )
         components.html(map_html, height=620, scrolling=False)
+
+        # ── Nút bắt đầu dẫn đường Live Navigation ────────────────────────────
+        if _LIVE_NAV_OK:
+            st.divider()
+            _col_nav1, _col_nav2 = st.columns([3, 1])
+            with _col_nav1:
+                if st.button(
+                    "▶️ Bắt đầu dẫn đường theo GPS",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_start_live_nav",
+                ):
+                    # Truyền tuyến hiện tại sang Live Navigation
+                    st.session_state["nav_active"]        = True
+                    st.session_state["nav_polyline"]      = polyline
+                    st.session_state["nav_risk_segs"]     = []
+                    st.session_state["nav_dest"]          = (lat2, lon2)
+                    st.session_state["nav_dest_name"]     = st.session_state.get("last_dest_name", f"{lat2:.4f},{lon2:.4f}")
+                    st.session_state["nav_origin"]        = (lat1, lon1)
+                    st.session_state["nav_mode"]          = mode
+                    st.session_state["nav_progress_idx"]  = 0
+                    st.session_state["nav_max_progress"]  = 0
+                    st.session_state["nav_offroute"]      = False
+                    st.session_state["nav_reroute_pl"]    = None
+                    st.session_state["nav_reroute_risk"]  = None
+                    st.session_state["nav_last_reroute"]  = 0.0
+                    st.session_state["nav_gps_lat"]       = lat1
+                    st.session_state["nav_gps_lon"]       = lon1
+                    st.session_state["nav_arrived"]       = False
+                    st.session_state["nav_steps"]         = route.get("steps", [])
+                    st.session_state["nav_distance_left"] = route.get("distance_km", 0)
+                    st.session_state["nav_step_text"]     = ""
+                    st.session_state["_show_live_nav"]    = True
+                    st.rerun()
+            with _col_nav2:
+                st.caption("🛣️ Dẫn đường thời gian thực với GPS thật")
+
+        # Hiển thị Live Navigation nếu đang bật
+        if _LIVE_NAV_OK and st.session_state.get("_show_live_nav"):
+            st.divider()
+            render_live_navigation(router=router, risk_engine=risk_engine)
 
         # TABS
         tab_danger, tab_rest, tab_poi, tab_steps = st.tabs([
