@@ -255,17 +255,27 @@ def _do_reroute(router, risk_engine, gps_lat, gps_lon, dest_lat, dest_lon, mode)
     Trả về (polyline, risk_segs, steps, summary_dict) hoặc (None,...) nếu lỗi.
     """
     try:
-        # Lấy nhiều phương án (nếu router hỗ trợ alternatives)
-        kwargs = dict(
-            origin      = (gps_lat, gps_lon),
-            destination = (dest_lat, dest_lon),
-            mode        = mode,
-        )
-        # Thử alternatives=True
+        # Lấy nhiều phương án nếu Router hỗ trợ
         try:
-            result = router.get_route(**kwargs, alternatives=True)
+            if hasattr(router, "get_alternative_routes"):
+                result = router.get_alternative_routes(
+                    (gps_lat, gps_lon),
+                    (dest_lat, dest_lon),
+                    mode=mode,
+                    count=3,
+                )
+            else:
+                result = router.get_route(
+                    (gps_lat, gps_lon),
+                    (dest_lat, dest_lon),
+                    mode=mode,
+                )
         except TypeError:
-            result = router.get_route(**kwargs)
+            result = router.get_route(
+                (gps_lat, gps_lon),
+                (dest_lat, dest_lon),
+                mode=mode,
+            )
 
         routes = result if isinstance(result, list) else [result]
 

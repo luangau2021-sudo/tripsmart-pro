@@ -1307,7 +1307,11 @@ if "Tìm đường" in menu:
         # Hiển thị Live Navigation nếu đang bật
         if _LIVE_NAV_OK and st.session_state.get("_show_live_nav"):
             st.divider()
-            render_live_navigation(router=router, risk_engine=risk_engine)
+            render_live_navigation(
+                router=router,
+                risk_engine=risk_engine,
+                maps_api=maps_api,
+            )
 
         # TABS
         tab_danger, tab_rest, tab_poi, tab_steps = st.tabs([
