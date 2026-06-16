@@ -1,5 +1,9 @@
 streamlit
 folium
 requests
-streamlit-autorefresh
 streamlit-js-eval
+numpy
+scikit-learn
+pandas
+joblib
+streamlit-autorefresh
