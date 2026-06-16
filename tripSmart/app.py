@@ -1125,10 +1125,19 @@ def make_full_map(lat1, lon1, lat2, lon2,
 </script>
 """
 
-    # Chèn JS vào cuối </body> trong HTML Folium
-    if "</body>" in base_html:
-        return base_html.replace("</body>", live_gps_js + "\n</body>")
-    return base_html + live_gps_js
+    # QUAN TRỌNG:
+    # m._repr_html_() của Folium trả về một iframe. Nếu nối <script> vào base_html
+    # thì script chạy ở trang cha của iframe, không nhìn thấy biến map_<uuid> của Leaflet.
+    # Vì vậy phải nhúng script vào chính HTML gốc của Folium trước khi _repr_html_().
+    try:
+        from branca.element import Element
+        m.get_root().html.add_child(Element(live_gps_js))
+        return m._repr_html_()
+    except Exception:
+        # Fallback cũ: ít ổn định hơn, chỉ để tránh làm app crash nếu branca lỗi.
+        if "</body>" in base_html:
+            return base_html.replace("</body>", live_gps_js + "\n</body>")
+        return base_html + live_gps_js
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1586,7 +1595,9 @@ if "Tìm đường" in menu:
         </div>""", unsafe_allow_html=True)
 
         # ── Bật/tắt dẫn đường theo GPS (gộp vào bản đồ chính) ────────────────
-        if _LIVE_NAV_OK:
+        # Không phụ thuộc _LIVE_NAV_OK để bật marker GPS client-side.
+        # _LIVE_NAV_OK chỉ cần cho snap/reroute Python; marker live dùng JS trong bản đồ.
+        if True:
             st.divider()
             _col_nav1, _col_nav2 = st.columns([3, 1])
             with _col_nav1:
@@ -1636,7 +1647,7 @@ if "Tìm đường" in menu:
         # Python không cần gọi get_geolocation() hay st_autorefresh nữa.
         # gps_position chỉ dùng để render HUD + IoT panel (dùng tọa độ từ session).
         gps_position = None
-        if _LIVE_NAV_OK and st.session_state.get("nav_active") and not st.session_state.get("nav_arrived"):
+        if st.session_state.get("nav_active") and not st.session_state.get("nav_arrived"):
             ss = st.session_state
 
             # Đọc GPS cuối cùng từ session (đã lưu qua postMessage/localStorage-polling nếu cần)
@@ -1654,7 +1665,11 @@ if "Tìm đường" in menu:
                     st.success("🎉 Bạn đã đến điểm đến!")
 
                 # 3) Snap lên tuyến + tính tiến trình
-                snap = _snap_to_route(g_lat, g_lon, nav_polyline) if nav_polyline else {"idx": 0, "dist_km": 0}
+                if _LIVE_NAV_OK and nav_polyline:
+                    snap = _snap_to_route(g_lat, g_lon, nav_polyline)
+                else:
+                    snap = _find_nearest_segment(g_lat, g_lon, nav_polyline) if nav_polyline else {"segment_idx": 0, "dist_km": 0}
+                    snap["idx"] = snap.get("idx", snap.get("segment_idx", 0))
                 snap_idx = snap["idx"]
                 off_dist = snap["dist_km"]
 
@@ -1717,7 +1732,7 @@ if "Tìm đường" in menu:
 
         # BẢN ĐỒ — gộp tuyến hành trình + GPS hiện tại trong CÙNG 1 bản đồ
         st.subheader("🗺️ Bản đồ hành trình")
-        _nav_active = _LIVE_NAV_OK and st.session_state.get("nav_active", False)
+        _nav_active = st.session_state.get("nav_active", False)
         alt_routes_other = [rt for i,rt in enumerate(routes) if i != selected]
         map_html = make_full_map(
             lat1, lon1, lat2, lon2,
