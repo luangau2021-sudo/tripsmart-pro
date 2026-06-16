@@ -4,11 +4,8 @@ try:
     _JSEVAL_OK = True
 except ImportError:
     _JSEVAL_OK = False
-try:
-    from streamlit_autorefresh import st_autorefresh
-    _AUTOREFRESH_OK = True
-except ImportError:
-    _AUTOREFRESH_OK = False
+# st_autorefresh removed — GPS now updates via JS watchPosition() inside map HTML,
+# so Streamlit never needs to reload the page to move the GPS marker.
 import streamlit.components.v1 as components
 import sys, os, folium, json
 
@@ -588,7 +585,10 @@ def make_full_map(lat1, lon1, lat2, lon2,
                   reports=None,
                   incident_marker=None,
                   forecast_segments=None,
-                  gps_position=None):
+                  gps_position=None,
+                  enable_live_gps=False,
+                  dest_lat=None,
+                  dest_lon=None):
 
     mid_lat = (lat1 + lat2) / 2
     mid_lon = (lon1 + lon2) / 2
@@ -884,7 +884,251 @@ def make_full_map(lat1, lon1, lat2, lon2,
     if all_lats and all_lons:
         m.fit_bounds([[min(all_lats)-pad, min(all_lons)-pad],
                       [max(all_lats)+pad, max(all_lons)+pad]])
-    return m._repr_html_()
+
+    base_html = m._repr_html_()
+
+    # ── Live GPS JS injection ─────────────────────────────────────────────────
+    # Khi enable_live_gps=True, chèn JS watchPosition() vào HTML bản đồ.
+    # Marker GPS được tạo và cập nhật HOÀN TOÀN phía client — không reload Streamlit,
+    # không st_autorefresh, không mờ/chớp.
+    if not enable_live_gps:
+        return base_html
+
+    _dest_lat = dest_lat if dest_lat is not None else lat2
+    _dest_lon = dest_lon if dest_lon is not None else lon2
+
+    # Serialize danger markers để JS có thể tính IoT state
+    _dm_js = json.dumps([
+        {
+            "lat":   seg.get("lat", 0),
+            "lon":   seg.get("lon", 0),
+            "score": seg.get("score", 0),
+            "label": seg.get("label", ""),
+            "icon":  seg.get("icon", "⚠️"),
+        }
+        for seg in (danger_markers or [])
+        if seg.get("lat") and seg.get("lon")
+    ])
+
+    # Serialize polyline để JS snap & tính progress
+    _poly_js = json.dumps([
+        [p[1], p[0]] for p in (route_polyline or []) if len(p) >= 2
+    ])
+
+    live_gps_js = f"""
+<script>
+(function() {{
+  // ── Haversine distance (km) ───────────────────────────────────────────────
+  function hav(lat1, lon1, lat2, lon2) {{
+    var R = 6371.0, r = Math.PI/180;
+    var dlat = (lat2-lat1)*r, dlon = (lon2-lon1)*r;
+    var a = Math.sin(dlat/2)*Math.sin(dlat/2) +
+            Math.cos(lat1*r)*Math.cos(lat2*r)*Math.sin(dlon/2)*Math.sin(dlon/2);
+    return R * 2 * Math.asin(Math.sqrt(Math.max(0,a)));
+  }}
+
+  // ── Data từ Python (serialize 1 lần khi render) ──────────────────────────
+  var DANGER_MARKERS = {_dm_js};
+  var ROUTE_POLY     = {_poly_js};   // [[lat,lon], ...]
+  var DEST_LAT       = {_dest_lat};
+  var DEST_LON       = {_dest_lon};
+  var OFFROUTE_KM    = 0.08;
+
+  // ── Tìm Leaflet map object ────────────────────────────────────────────────
+  function getLeafletMap() {{
+    // Folium gắn map vào biến toàn cục có tên map_<uuid>
+    for (var k in window) {{
+      if (k.startsWith('map_') && window[k] && typeof window[k].addLayer === 'function') {{
+        return window[k];
+      }}
+    }}
+    return null;
+  }}
+
+  var gpsMarker    = null;
+  var pulseCircle  = null;
+  var watchId      = null;
+  var mapObj       = null;
+  var statusEl     = null;
+  var arrived      = false;
+
+  // ── Tạo status badge trong bản đồ ────────────────────────────────────────
+  function createStatusBadge(map) {{
+    var badge = L.control({{position: 'topright'}});
+    badge.onAdd = function() {{
+      var div = L.DomUtil.create('div', '');
+      div.id  = 'gps-live-badge';
+      div.style.cssText = 'background:white;border-radius:20px;padding:6px 14px;' +
+        'font-family:sans-serif;font-size:.82rem;font-weight:600;' +
+        'border:1.5px solid #1976d2;color:#1565c0;cursor:pointer;' +
+        'box-shadow:0 2px 8px rgba(0,0,0,.2);';
+      div.innerHTML = '📡 Bật GPS';
+      div.onclick = function() {{ startGPS(map); }};
+      statusEl = div;
+      return div;
+    }};
+    badge.addTo(map);
+  }}
+
+  function setStatus(text, color) {{
+    if (statusEl) {{
+      statusEl.innerHTML = text;
+      statusEl.style.color       = color || '#1565c0';
+      statusEl.style.borderColor = color || '#1976d2';
+    }}
+  }}
+
+  // ── Snap GPS lên polyline, trả về khoảng cách lệch tuyến ─────────────────
+  function snapToRoute(lat, lon) {{
+    if (!ROUTE_POLY.length) return {{idx: 0, dist: 0}};
+    var bestIdx = 0, bestDist = 9999;
+    for (var i = 0; i < ROUTE_POLY.length; i++) {{
+      var d = hav(lat, lon, ROUTE_POLY[i][0], ROUTE_POLY[i][1]);
+      if (d < bestDist) {{ bestDist = d; bestIdx = i; }}
+    }}
+    return {{idx: bestIdx, dist: bestDist}};
+  }}
+
+  // ── Tính IoT state từ GPS ─────────────────────────────────────────────────
+  function calcIoTState(lat, lon) {{
+    var nearestDist = 9999, nearestDanger = null;
+    for (var i = 0; i < DANGER_MARKERS.length; i++) {{
+      var d = hav(lat, lon, DANGER_MARKERS[i].lat, DANGER_MARKERS[i].lon);
+      if (d < nearestDist) {{ nearestDist = d; nearestDanger = DANGER_MARKERS[i]; }}
+    }}
+    var score = (nearestDanger && nearestDist < 1.0) ? nearestDanger.score : 0;
+    if (score >= 0.60 || nearestDist < 0.5) return 'danger';
+    if (score >= 0.35 || nearestDist < 2.0) return 'warning';
+    return 'safe';
+  }}
+
+  // ── Cập nhật marker GPS trên bản đồ ──────────────────────────────────────
+  function updateGPSMarker(map, lat, lon) {{
+    var snap     = snapToRoute(lat, lon);
+    var offRoute = snap.dist > OFFROUTE_KM;
+    var state    = calcIoTState(lat, lon);
+
+    var color = offRoute ? '#e53935' : (state === 'danger' ? '#e53935' :
+                                        state === 'warning' ? '#f9a825' : '#1a73e8');
+
+    // Xóa marker cũ
+    if (gpsMarker)   {{ map.removeLayer(gpsMarker);   gpsMarker   = null; }}
+    if (pulseCircle) {{ map.removeLayer(pulseCircle); pulseCircle = null; }}
+
+    // Vòng nhấp nháy (CSS animation trong DivIcon)
+    var pulseIcon = L.divIcon({{
+      className: '',
+      html: '<div style="width:36px;height:36px;border-radius:50%;border:3px solid ' + color + ';' +
+            'margin-top:-18px;margin-left:-18px;' +
+            'animation:gpsnavpulse 1.6s infinite;"></div>' +
+            '<style>@keyframes gpsnavpulse{{' +
+            '0%{{transform:scale(.7);opacity:1}}' +
+            '70%{{transform:scale(2.2);opacity:0}}' +
+            '100%{{transform:scale(.7);opacity:0}}' +
+            '}}</style>',
+      iconSize:   [0, 0],
+      iconAnchor: [0, 0],
+    }});
+
+    gpsMarker = L.marker([lat, lon], {{icon: pulseIcon, zIndexOffset: 1000}}).addTo(map);
+
+    // Chấm chính + emoji người
+    pulseCircle = L.circleMarker([lat, lon], {{
+      radius:      10,
+      color:       color,
+      fillColor:   color,
+      fillOpacity: 0.9,
+      weight:      2,
+    }}).addTo(map);
+    pulseCircle.bindTooltip('📍 Vị trí của bạn (GPS live)');
+
+    // Status badge
+    var stateEmoji = state === 'danger' ? '🔴' : state === 'warning' ? '🟡' : '🟢';
+    setStatus(stateEmoji + ' GPS ' + lat.toFixed(5) + ', ' + lon.toFixed(5), color);
+
+    // Lưu localStorage để Python có thể đọc (cho IoT panel)
+    try {{
+      localStorage.setItem('tripsmart_gps', JSON.stringify({{
+        lat: lat, lon: lon, acc: 0, ts: Date.now(),
+        offRoute: offRoute, iotState: state,
+      }}));
+    }} catch(e) {{}}
+
+    // Gửi postMessage lên parent (cho Streamlit biết nếu cần)
+    try {{
+      window.parent.postMessage({{
+        type: 'tripsmart_gps',
+        payload: {{lat, lon, acc: 0, ts: Date.now(), offRoute, iotState: state}},
+      }}, '*');
+    }} catch(e) {{}}
+
+    // Kiểm tra đến nơi
+    if (!arrived && hav(lat, lon, DEST_LAT, DEST_LON) < 0.05) {{
+      arrived = true;
+      setStatus('🎉 Đã đến điểm đến!', '#2e7d32');
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    }}
+  }}
+
+  // ── Bắt đầu watchPosition ─────────────────────────────────────────────────
+  function startGPS(map) {{
+    if (!navigator.geolocation) {{
+      setStatus('❌ Trình duyệt không hỗ trợ GPS', '#b71c1c');
+      return;
+    }}
+    setStatus('⏳ Đang chờ GPS…', '#f57c00');
+
+    // Lần đầu: lấy ngay
+    navigator.geolocation.getCurrentPosition(
+      function(pos) {{ updateGPSMarker(map, pos.coords.latitude, pos.coords.longitude); }},
+      function(err) {{ setStatus('❌ ' + (err.code===1 ? 'Bị từ chối quyền GPS' : 'Lỗi GPS'), '#b71c1c'); }},
+      {{enableHighAccuracy: true, timeout: 10000, maximumAge: 0}}
+    );
+
+    // Theo dõi liên tục — cập nhật marker KHÔNG reload Streamlit
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    watchId = navigator.geolocation.watchPosition(
+      function(pos) {{ updateGPSMarker(map, pos.coords.latitude, pos.coords.longitude); }},
+      function(err) {{ setStatus('⚠️ Mất tín hiệu GPS', '#f57c00'); }},
+      {{enableHighAccuracy: true, timeout: 10000, maximumAge: 2000}}
+    );
+  }}
+
+  // ── Khởi động sau khi Leaflet map sẵn sàng ───────────────────────────────
+  function init() {{
+    mapObj = getLeafletMap();
+    if (!mapObj) {{
+      setTimeout(init, 200);
+      return;
+    }}
+    createStatusBadge(mapObj);
+
+    // Tự bật GPS nếu đã có quyền (saved localStorage < 30s)
+    try {{
+      var saved = localStorage.getItem('tripsmart_gps');
+      if (saved) {{
+        var p = JSON.parse(saved);
+        if (Date.now() - p.ts < 30000) {{
+          setTimeout(function() {{ startGPS(mapObj); }}, 500);
+        }}
+      }}
+    }} catch(e) {{}}
+  }}
+
+  // Đợi DOM + Leaflet load xong
+  if (document.readyState === 'complete') {{
+    setTimeout(init, 300);
+  }} else {{
+    window.addEventListener('load', function() {{ setTimeout(init, 300); }});
+  }}
+}})();
+</script>
+"""
+
+    # Chèn JS vào cuối </body> trong HTML Folium
+    if "</body>" in base_html:
+        return base_html.replace("</body>", live_gps_js + "\n</body>")
+    return base_html + live_gps_js
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1388,21 +1632,17 @@ if "Tìm đường" in menu:
                 st.caption("🛣️ Dẫn đường thời gian thực với GPS thật")
 
         # ── Cập nhật GPS & tính gps_position cho bản đồ chính ────────────────
+        # GPS được cập nhật hoàn toàn qua JS watchPosition() trong HTML bản đồ.
+        # Python không cần gọi get_geolocation() hay st_autorefresh nữa.
+        # gps_position chỉ dùng để render HUD + IoT panel (dùng tọa độ từ session).
         gps_position = None
         if _LIVE_NAV_OK and st.session_state.get("nav_active") and not st.session_state.get("nav_arrived"):
             ss = st.session_state
 
-            # 1) Lấy GPS mới nếu có thể
-            g_lat, g_lon = ss.get("nav_gps_lat"), ss.get("nav_gps_lon")
-            if _JSEVAL_OK:
-                _geo = get_geolocation()
-                if _geo and _geo.get("coords"):
-                    _new_lat = _geo["coords"]["latitude"]
-                    _new_lon = _geo["coords"]["longitude"]
-                    if g_lat is None or _hav(g_lat, g_lon, _new_lat, _new_lon) > 0.003:
-                        g_lat, g_lon = _new_lat, _new_lon
-                        ss["nav_gps_lat"] = g_lat
-                        ss["nav_gps_lon"] = g_lon
+            # Đọc GPS cuối cùng từ session (đã lưu qua postMessage/localStorage-polling nếu cần)
+            # Khi nav_active, bản đồ tự cập nhật marker via JS — không cần rerun ở đây
+            g_lat = ss.get("nav_gps_lat")
+            g_lon = ss.get("nav_gps_lon")
 
             if g_lat is not None and g_lon is not None:
                 nav_polyline = ss.get("nav_polyline") or polyline
@@ -1477,6 +1717,7 @@ if "Tìm đường" in menu:
 
         # BẢN ĐỒ — gộp tuyến hành trình + GPS hiện tại trong CÙNG 1 bản đồ
         st.subheader("🗺️ Bản đồ hành trình")
+        _nav_active = _LIVE_NAV_OK and st.session_state.get("nav_active", False)
         alt_routes_other = [rt for i,rt in enumerate(routes) if i != selected]
         map_html = make_full_map(
             lat1, lon1, lat2, lon2,
@@ -1489,6 +1730,9 @@ if "Tìm đường" in menu:
             reports=rpts,
             forecast_segments=route_risk_forecast.get("segments") if route_risk_forecast else None,
             gps_position=gps_position,
+            enable_live_gps=_nav_active,
+            dest_lat=lat2,
+            dest_lon=lon2,
         )
         components.html(map_html, height=620, scrolling=False)
 
@@ -1503,12 +1747,11 @@ if "Tìm đường" in menu:
             h3.metric("📡 Lệch tuyến", "Có" if gps_position["off_route"] else "Không")
             st.progress(min(1.0, _progress_pct))
 
-        # ── Auto refresh mỗi 1 giây khi đang dẫn đường ──────────────────────
+        # ── GPS cập nhật tự động qua JS watchPosition() trong bản đồ ──────────
+        # Không cần st_autorefresh hay reload Streamlit — marker GPS di chuyển
+        # hoàn toàn phía client, bản đồ không mờ/chớp.
         if st.session_state.get("nav_active") and not st.session_state.get("nav_arrived"):
-            if _AUTOREFRESH_OK:
-                st_autorefresh(interval=1000, key="live_nav_refresh")
-            else:
-                st.caption("ℹ️ Cài `streamlit-autorefresh` để tự động cập nhật GPS mỗi giây: `pip install streamlit-autorefresh`")
+            st.info("📡 GPS đang chạy — bấm nút **📡 Bật GPS** trên bản đồ để bật theo dõi vị trí thật.")
 
 
         # TABS
@@ -1602,13 +1845,14 @@ if "Tìm đường" in menu:
             gps_html = _build_gps_component_html(interval_ms=5000)
             components.html(gps_html, height=72, scrolling=False)
 
-            # ── Nhận tọa độ từ query_params (Streamlit ≥1.27 dùng st.query_params) ─
-            # Cách hoạt động: JS ghi vào localStorage; nút "Cập nhật GPS" đọc lại
-            # và lưu vào session. Không cần st.experimental_rerun liên tục.
+            # ── Đọc tọa độ GPS từ localStorage qua JS → Streamlit text_input ─
+            # JS tự điền ô input khi nhận được postMessage từ GPS component.
+            # User chỉ cần bấm "Cập nhật vị trí" để IoT panel tính lại — không
+            # cần reload toàn app, chỉ rerun khi user muốn.
             gps_col1, gps_col2 = st.columns([3, 1])
             with gps_col1:
                 _gps_input = st.text_input(
-                    "📍 Nhập tọa độ GPS (lat,lon) — tự điền sau khi bấm Lấy GPS hoặc nhập tay",
+                    "📍 Tọa độ GPS hiện tại (tự điền hoặc nhập tay)",
                     value=st.session_state.get("gps_manual_input", ""),
                     placeholder="VD: 11.9404, 108.4583",
                     key="gps_coord_input",
@@ -1619,17 +1863,17 @@ if "Tìm đường" in menu:
                     st.session_state["gps_manual_input"] = _gps_input
                     st.rerun()
 
-            # Thêm JS tự điền ô input khi GPS được lấy
+            # JS: lắng nghe postMessage từ GPS component → điền vào ô input
             st.markdown("""
 <script>
 window.addEventListener('message', function(e) {
   if (e.data && e.data.type === 'tripsmart_gps') {
-    const p = e.data.payload;
-    const coord = p.lat.toFixed(6) + ', ' + p.lon.toFixed(6);
-    // Tìm input Streamlit và gán giá trị
-    const inputs = window.parent.document.querySelectorAll('input[type="text"]');
-    for (const inp of inputs) {
-      if (inp.placeholder && inp.placeholder.includes('lat,lon')) {
+    var p = e.data.payload;
+    var coord = p.lat.toFixed(6) + ', ' + p.lon.toFixed(6);
+    var inputs = window.parent.document.querySelectorAll('input[type="text"]');
+    for (var i = 0; i < inputs.length; i++) {
+      var inp = inputs[i];
+      if (inp.placeholder && inp.placeholder.includes('lat,lon') || inp.placeholder.includes('9404')) {
         inp.value = coord;
         inp.dispatchEvent(new Event('input', {bubbles:true}));
         break;
@@ -1721,19 +1965,9 @@ window.addEventListener('message', function(e) {
                     unsafe_allow_html=True,
                 )
 
-                # ── Cập nhật tự động mỗi 10 giây khi GPS đang chạy ──────────
-                st.markdown("""
-<script>
-setTimeout(function() {
-  // Tìm nút Cập nhật vị trí và click tự động
-  const btns = window.parent.document.querySelectorAll('button');
-  for (const b of btns) {
-    if (b.innerText && b.innerText.includes('Cập nhật vị trí')) {
-      b.click(); break;
-    }
-  }
-}, 10000);
-</script>""", unsafe_allow_html=True)
+                # ── IoT panel đã hiển thị — không cần auto-click nút nữa ────
+                # GPS cập nhật qua JS; user bấm "Cập nhật vị trí" khi muốn
+                # làm mới IoT panel (reroute, cảnh báo, v.v.)
 
             else:
                 st.info("📡 Bấm **Bật GPS tự động** ở trên để lấy vị trí, "
