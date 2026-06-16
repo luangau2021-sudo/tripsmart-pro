@@ -4,12 +4,18 @@ try:
     _JSEVAL_OK = True
 except ImportError:
     _JSEVAL_OK = False
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _AUTOREFRESH_OK = True
+except ImportError:
+    _AUTOREFRESH_OK = False
 import streamlit.components.v1 as components
 import sys, os, folium, json
 
-# ── Live Navigation (tích hợp vào phần Tìm đường) ───────────────────────────
+# ── Live Navigation: chỉ dùng các hàm tiện ích (snap GPS, reroute) ──────────
+# KHÔNG dùng render_live_navigation() nữa — GPS được vẽ thẳng vào make_full_map()
 try:
-    from live_navigation import render_live_navigation
+    from live_navigation import _snap_to_route, _hav, _do_reroute
     _LIVE_NAV_OK = True
 except ImportError:
     _LIVE_NAV_OK = False
@@ -581,7 +587,8 @@ def make_full_map(lat1, lon1, lat2, lon2,
                   pois=None,
                   reports=None,
                   incident_marker=None,
-                  forecast_segments=None):
+                  forecast_segments=None,
+                  gps_position=None):
 
     mid_lat = (lat1 + lat2) / 2
     mid_lon = (lon1 + lon2) / 2
@@ -788,6 +795,88 @@ def make_full_map(lat1, lon1, lat2, lon2,
                 weight=1,
                 popup=folium.Popup(popup_html, max_width=240),
                 tooltip=f"{seg.get('icon','⚪')} km {seg.get('route_km',0):.0f} · ETA {seg.get('eta_text','')} · {seg.get('label','')}",
+            ).add_to(m)
+
+    # ── GPS hiện tại — chấm/hình nhân nhấp nháy + tô đoạn đã đi/chưa đi ──────
+    # gps_position: {"lat":.., "lon":.., "progress_idx":.., "off_route":bool,
+    #                 "reroute_polyline":[[lon,lat],...] hoặc None}
+    if gps_position:
+        g_lat = gps_position.get("lat")
+        g_lon = gps_position.get("lon")
+        g_progress_idx = gps_position.get("progress_idx", 0)
+        g_offroute = gps_position.get("off_route", False)
+        g_reroute_pl = gps_position.get("reroute_polyline")
+
+        if g_lat is not None and g_lon is not None:
+            all_lats.append(g_lat)
+            all_lons.append(g_lon)
+
+            # Tô lại đoạn ĐÃ ĐI (xám mờ) chồng lên tuyến gốc, dựa trên progress_idx
+            if route_polyline and g_progress_idx > 0:
+                try:
+                    coords_past = [[p[1], p[0]] for p in route_polyline[:g_progress_idx + 1] if len(p) >= 2]
+                    if len(coords_past) >= 2:
+                        folium.PolyLine(
+                            coords_past,
+                            color="#9e9e9e", weight=7, opacity=0.6,
+                            tooltip="Đoạn đã đi qua",
+                            smooth_factor=0, line_cap="round", line_join="round",
+                        ).add_to(m)
+                except Exception:
+                    pass
+
+            # Nếu lệch tuyến và có tuyến tính lại → vẽ tuyến mới màu cam
+            if g_offroute and g_reroute_pl and len(g_reroute_pl) >= 2:
+                try:
+                    coords_new = [[p[1], p[0]] for p in g_reroute_pl if len(p) >= 2]
+                    all_lats += [p[1] for p in g_reroute_pl if len(p) >= 2]
+                    all_lons += [p[0] for p in g_reroute_pl if len(p) >= 2]
+                    folium.PolyLine(
+                        coords_new, color="#ff6f00", weight=6, opacity=0.9,
+                        tooltip="Tuyến tính lại (an toàn nhất)",
+                        smooth_factor=0, line_cap="round", line_join="round",
+                    ).add_to(m)
+                except Exception:
+                    pass
+
+            pulse_color = "#e53935" if g_offroute else "#1a73e8"
+
+            # Vòng nhấp nháy ngoài
+            pulse_html = f"""
+            <div style="
+                width:30px; height:30px;
+                border-radius:50%;
+                background:transparent;
+                border: 3px solid {pulse_color};
+                margin-top:-15px; margin-left:-15px;
+                animation: gpsnavpulse 1.6s infinite;
+            "></div>
+            <style>
+            @keyframes gpsnavpulse {{
+                0%   {{ transform:scale(0.8); opacity:1; }}
+                70%  {{ transform:scale(2.2); opacity:0; }}
+                100% {{ transform:scale(0.8); opacity:0; }}
+            }}
+            </style>"""
+            folium.Marker(
+                [g_lat, g_lon],
+                icon=folium.DivIcon(html=pulse_html),
+                z_index_offset=1000,
+            ).add_to(m)
+
+            # Chấm GPS / hình nhân ở giữa
+            folium.CircleMarker(
+                location=[g_lat, g_lon],
+                radius=10,
+                color=pulse_color, fill=True,
+                fill_color=pulse_color, fill_opacity=0.9,
+                weight=2,
+                tooltip="📍 Vị trí của bạn (GPS)",
+            ).add_to(m)
+            folium.Marker(
+                [g_lat, g_lon],
+                icon=folium.DivIcon(html='<div style="font-size:22px;margin-top:-34px;text-align:center">🧍</div>'),
+                tooltip="📍 Vị trí của bạn (GPS)",
             ).add_to(m)
 
     folium.LayerControl(collapsed=True).add_to(m)
@@ -1252,66 +1341,175 @@ if "Tìm đường" in menu:
           &nbsp;|&nbsp; 🟡🟠🔴⚪ Dự báo rủi ro theo giờ đi qua
         </div>""", unsafe_allow_html=True)
 
-        # BẢN ĐỒ
+        # ── Bật/tắt dẫn đường theo GPS (gộp vào bản đồ chính) ────────────────
+        if _LIVE_NAV_OK:
+            st.divider()
+            _col_nav1, _col_nav2 = st.columns([3, 1])
+            with _col_nav1:
+                if not st.session_state.get("nav_active"):
+                    if st.button(
+                        "▶️ Bắt đầu dẫn đường theo GPS",
+                        type="primary",
+                        use_container_width=True,
+                        key="btn_start_live_nav",
+                    ):
+                        st.session_state["nav_active"]        = True
+                        st.session_state["nav_polyline"]      = polyline
+                        st.session_state["nav_risk_segs"]     = []
+                        st.session_state["nav_dest"]          = (lat2, lon2)
+                        st.session_state["nav_dest_name"]     = st.session_state.get("last_dest_name", f"{lat2:.4f},{lon2:.4f}")
+                        st.session_state["nav_origin"]        = (lat1, lon1)
+                        st.session_state["nav_mode"]          = mode
+                        st.session_state["nav_progress_idx"]  = 0
+                        st.session_state["nav_max_progress"]  = 0
+                        st.session_state["nav_offroute"]      = False
+                        st.session_state["nav_reroute_pl"]    = None
+                        st.session_state["nav_reroute_risk"]  = None
+                        st.session_state["nav_last_reroute"]  = 0.0
+                        st.session_state["nav_gps_lat"]       = lat1
+                        st.session_state["nav_gps_lon"]       = lon1
+                        st.session_state["nav_arrived"]       = False
+                        st.session_state["nav_steps"]         = route.get("steps", [])
+                        st.session_state["nav_distance_left"] = route.get("distance_km", 0)
+                        st.session_state["nav_step_text"]     = ""
+                        st.rerun()
+                else:
+                    if st.button(
+                        "⏹️ Dừng dẫn đường",
+                        type="secondary",
+                        use_container_width=True,
+                        key="btn_stop_live_nav",
+                    ):
+                        for _k in list(st.session_state.keys()):
+                            if _k.startswith("nav_"):
+                                del st.session_state[_k]
+                        st.rerun()
+            with _col_nav2:
+                st.caption("🛣️ Dẫn đường thời gian thực với GPS thật")
+
+        # ── Cập nhật GPS & tính gps_position cho bản đồ chính ────────────────
+        gps_position = None
+        if _LIVE_NAV_OK and st.session_state.get("nav_active") and not st.session_state.get("nav_arrived"):
+            ss = st.session_state
+
+            # 1) Lấy GPS mới nếu có thể
+            g_lat, g_lon = ss.get("nav_gps_lat"), ss.get("nav_gps_lon")
+            if _JSEVAL_OK:
+                _geo = get_geolocation()
+                if _geo and _geo.get("coords"):
+                    _new_lat = _geo["coords"]["latitude"]
+                    _new_lon = _geo["coords"]["longitude"]
+                    if g_lat is None or _hav(g_lat, g_lon, _new_lat, _new_lon) > 0.003:
+                        g_lat, g_lon = _new_lat, _new_lon
+                        ss["nav_gps_lat"] = g_lat
+                        ss["nav_gps_lon"] = g_lon
+
+            if g_lat is not None and g_lon is not None:
+                nav_polyline = ss.get("nav_polyline") or polyline
+                dest_lat, dest_lon = ss.get("nav_dest", (lat2, lon2))
+
+                # 2) Đến nơi?
+                if _hav(g_lat, g_lon, dest_lat, dest_lon) < 0.05:
+                    ss["nav_arrived"] = True
+                    st.success("🎉 Bạn đã đến điểm đến!")
+
+                # 3) Snap lên tuyến + tính tiến trình
+                snap = _snap_to_route(g_lat, g_lon, nav_polyline) if nav_polyline else {"idx": 0, "dist_km": 0}
+                snap_idx = snap["idx"]
+                off_dist = snap["dist_km"]
+
+                if snap_idx >= ss.get("nav_max_progress", 0) - 2:
+                    ss["nav_max_progress"] = max(ss.get("nav_max_progress", 0), snap_idx)
+                    ss["nav_progress_idx"] = snap_idx
+                else:
+                    ss["nav_progress_idx"] = snap_idx
+
+                # 4) Phát hiện lệch tuyến + tự tính lại
+                is_offroute = ss.get("nav_offroute", False)
+                if off_dist > 0.08 and not is_offroute:
+                    ss["nav_offroute"] = True
+                    is_offroute = True
+                if off_dist <= 0.05 and is_offroute:
+                    ss["nav_offroute"]     = False
+                    ss["nav_reroute_pl"]   = None
+                    ss["nav_reroute_risk"] = None
+                    is_offroute = False
+
+                import time as _time
+                now = _time.time()
+                need_reroute = (
+                    is_offroute
+                    and ss.get("nav_reroute_pl") is None
+                    and (now - ss.get("nav_last_reroute", 0.0)) > 15
+                )
+                if need_reroute:
+                    with st.spinner("🔄 Đang tính lại tuyến an toàn..."):
+                        new_pl, new_risk, new_steps, _summary = _do_reroute(
+                            router, risk_engine, g_lat, g_lon, dest_lat, dest_lon,
+                            ss.get("nav_mode", mode),
+                        )
+                    if new_pl:
+                        ss["nav_polyline"]     = new_pl
+                        ss["nav_risk_segs"]    = new_risk
+                        ss["nav_steps"]        = new_steps
+                        ss["nav_progress_idx"] = 0
+                        ss["nav_max_progress"] = 0
+                        ss["nav_offroute"]     = False
+                        ss["nav_reroute_pl"]   = None
+                        ss["nav_last_reroute"] = now
+                        nav_polyline = new_pl
+                        is_offroute = False
+
+                gps_position = {
+                    "lat": g_lat,
+                    "lon": g_lon,
+                    "progress_idx": ss.get("nav_progress_idx", 0),
+                    "off_route": is_offroute,
+                    "reroute_polyline": ss.get("nav_reroute_pl"),
+                }
+
+                # Dùng polyline đang dẫn đường (có thể đã đổi sau reroute) để tô đoạn đã đi
+                _gps_progress_polyline = nav_polyline
+            else:
+                _gps_progress_polyline = polyline
+        else:
+            _gps_progress_polyline = polyline
+
+        # BẢN ĐỒ — gộp tuyến hành trình + GPS hiện tại trong CÙNG 1 bản đồ
         st.subheader("🗺️ Bản đồ hành trình")
         alt_routes_other = [rt for i,rt in enumerate(routes) if i != selected]
         map_html = make_full_map(
             lat1, lon1, lat2, lon2,
             colored_segments=colored_segs,
-            route_polyline=polyline,
+            route_polyline=_gps_progress_polyline if gps_position else polyline,
             alt_routes=alt_routes_other,
             danger_markers=danger_markers,
             rest_suggestions=rest_stops,
             pois=pois,
             reports=rpts,
             forecast_segments=route_risk_forecast.get("segments") if route_risk_forecast else None,
+            gps_position=gps_position,
         )
         components.html(map_html, height=620, scrolling=False)
 
-        # ── Nút bắt đầu dẫn đường Live Navigation ────────────────────────────
-        if _LIVE_NAV_OK:
-            st.divider()
-            _col_nav1, _col_nav2 = st.columns([3, 1])
-            with _col_nav1:
-                if st.button(
-                    "▶️ Bắt đầu dẫn đường theo GPS",
-                    type="primary",
-                    use_container_width=True,
-                    key="btn_start_live_nav",
-                ):
-                    # Truyền tuyến hiện tại sang Live Navigation
-                    st.session_state["nav_active"]        = True
-                    st.session_state["nav_polyline"]      = polyline
-                    st.session_state["nav_risk_segs"]     = []
-                    st.session_state["nav_dest"]          = (lat2, lon2)
-                    st.session_state["nav_dest_name"]     = st.session_state.get("last_dest_name", f"{lat2:.4f},{lon2:.4f}")
-                    st.session_state["nav_origin"]        = (lat1, lon1)
-                    st.session_state["nav_mode"]          = mode
-                    st.session_state["nav_progress_idx"]  = 0
-                    st.session_state["nav_max_progress"]  = 0
-                    st.session_state["nav_offroute"]      = False
-                    st.session_state["nav_reroute_pl"]    = None
-                    st.session_state["nav_reroute_risk"]  = None
-                    st.session_state["nav_last_reroute"]  = 0.0
-                    st.session_state["nav_gps_lat"]       = lat1
-                    st.session_state["nav_gps_lon"]       = lon1
-                    st.session_state["nav_arrived"]       = False
-                    st.session_state["nav_steps"]         = route.get("steps", [])
-                    st.session_state["nav_distance_left"] = route.get("distance_km", 0)
-                    st.session_state["nav_step_text"]     = ""
-                    st.session_state["_show_live_nav"]    = True
-                    st.rerun()
-            with _col_nav2:
-                st.caption("🛣️ Dẫn đường thời gian thực với GPS thật")
+        # ── HUD nhỏ khi đang dẫn đường ────────────────────────────────────────
+        if gps_position:
+            _nav_polyline_len = max(1, len(_gps_progress_polyline) - 1)
+            _progress_pct = st.session_state.get("nav_progress_idx", 0) / _nav_polyline_len
+            _dist_left = _hav(gps_position["lat"], gps_position["lon"], lat2, lon2)
+            h1, h2, h3 = st.columns(3)
+            h1.metric("📍 Còn lại", f"{_dist_left:.1f} km")
+            h2.metric("✅ Đã đi", f"{_progress_pct:.0%}")
+            h3.metric("📡 Lệch tuyến", "Có" if gps_position["off_route"] else "Không")
+            st.progress(min(1.0, _progress_pct))
 
-        # Hiển thị Live Navigation nếu đang bật
-        if _LIVE_NAV_OK and st.session_state.get("_show_live_nav"):
-            st.divider()
-            render_live_navigation(
-                router=router,
-                risk_engine=risk_engine,
-                maps_api=maps_api,
-            )
+        # ── Auto refresh mỗi 1 giây khi đang dẫn đường ──────────────────────
+        if st.session_state.get("nav_active") and not st.session_state.get("nav_arrived"):
+            if _AUTOREFRESH_OK:
+                st_autorefresh(interval=1000, key="live_nav_refresh")
+            else:
+                st.caption("ℹ️ Cài `streamlit-autorefresh` để tự động cập nhật GPS mỗi giây: `pip install streamlit-autorefresh`")
+
 
         # TABS
         tab_danger, tab_rest, tab_poi, tab_steps = st.tabs([
